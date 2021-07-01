@@ -1,2 +1,2 @@
-# NBA Betting
-Building sports betting models
+# Sports Analytics
+Repo to hold my sports analytics projects
