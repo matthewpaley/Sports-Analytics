@@ -1,0 +1,275 @@
+rm(list=ls())
+
+library(jsonlite)
+library(RCurl)
+library(lubridate)
+library(randomForest)
+library(dplyr)
+library(caret)
+library(reshape2)
+library(zoo)
+
+nfl_lines <- read.csv("nfl_lines.csv")
+all_games <- read.csv("nfl_games.csv")
+matchups2018 <- read.csv("nfl_games_2018.csv")
+
+nfl_teams <- data.frame(name = c("49ers","Raiders","Buccaneers","Titans","Redskins","Jets",
+                                 "Ravens","Bears","Bengals","Browns","Rams","Packers",
+                                 "Cowboys","Colts","Dolphins","Steelers","Falcons","Panthers",
+                                 "Chiefs","Chargers","Vikings","Seahawks","Eagles","Saints",
+                                 "Broncos","Patriots","Giants","Bills","Jaguars","Cardinals",
+                                 "Lions","Texans"),
+                        abbr = c("SF","OAK","TB","TEN","WSH","NYJ","BAL","CHI","CIN",
+                                 "CLE","LAR","GB","DAL","IND","MIA","PIT","ATL","CAR",
+                                 "KC","LAC","MIN","SEA","PHI","NO","DEN","NE","NYG",
+                                 "BUF","JAX","ARI","DET","HOU"))
+
+# Historical Game Results w/ Elo
+all_games$date <- as.character(all_games$ï..date)
+all_games$ï..date <- NULL
+all_games <- all_games[all_games$season>2001,]
+
+# 2018 Games
+matchups2018$date <- as.character(matchups2018$date)
+all_games <- rbind(all_games, matchups2018)
+
+# Merge nfl teams with lines
+nfl_lines <- merge(nfl_lines,
+                   nfl_teams,
+                   by.x = "team1",
+                   by.y = "name")
+nfl_lines$team1 <- nfl_lines$abbr
+nfl_lines$abbr <- NULL
+
+nfl_lines <- merge(nfl_lines,
+                   nfl_teams,
+                   by.x = "team2",
+                   by.y = "name")
+nfl_lines$team2 <- nfl_lines$abbr
+nfl_lines$abbr <- NULL
+
+nfl_lines$season <- ifelse(month(nfl_lines$game_date)<3,
+                           year(nfl_lines$game_date)-1,
+                           year(nfl_lines$game_date))
+
+# Merge Lines with Historical games
+all_games <- merge(all_games,
+                   nfl_lines,
+                   by.x = c("season","team1","team2"),
+                   by.y = c("season","team1","team2"),
+                   all.x = TRUE)
+
+games_na <- all_games[is.na(all_games$spread),]
+all_games <- all_games[!is.na(all_games$spread),]
+
+# Not matching games are because Home/Away are flipped
+games_na$spread <- NULL
+games_na$game_date <- NULL
+games_na$team1a <- games_na$team2
+games_na$team2 <- games_na$team1
+games_na$team1 <- games_na$team1a
+games_na$team1a <- NULL
+games_na <- merge(games_na,
+                  nfl_lines,
+                  by.x = c("season","team1","team2"),
+                  by.y = c("season","team1","team2"),
+                  all.x = TRUE)
+all_games <- rbind(all_games,games_na)
+all_games$game_date <- NULL
+all_games$elo_diff <- all_games$elo1 - all_games$elo2
+all_games$elo1 <- NULL
+all_games$elo2 <- NULL
+all_games$elo_prob1 <- NULL
+
+### Model
+# Feature Engineering
+all_games$num_date <- as.numeric(as.Date(all_games$date))
+
+prev_game <- melt(all_games[,c("num_date","team1","team2","result1")],
+                  id=c("num_date","result1"))
+prev_game <- unique(prev_game)
+prev_game <- prev_game %>% 
+  group_by(value) %>% 
+  arrange(num_date) %>% 
+  mutate(rest_days = num_date - lag(num_date, default = first(num_date)))
+
+prev_game <- prev_game %>% 
+  arrange(value, num_date) %>% 
+  mutate(last_3 = rollsumr(result1, k = 3, fill = NA)/3) %>% 
+  mutate(last_5 = rollsumr(result1, k = 5, fill = NA)/5) %>% 
+  mutate(last_10 = rollsumr(result1, k = 10, fill = NA)/10)
+
+# Remove NA, split into team1 and team2, change column names, and rbind
+prev_game <- prev_game[!is.na(prev_game$last_10),]
+prev_game_t1 <- prev_game[prev_game$variable=="team1",]
+prev_game_t1$variable <- NULL
+prev_game_t1$result1 <- NULL
+colnames(prev_game_t1) <- c("num_date","team1","t1_rest_days","t1_last3",
+                            "t1_last5","t1_last10")
+
+prev_game_t2 <- prev_game[prev_game$variable=="team2",]
+prev_game_t2$variable <- NULL
+prev_game_t2$result1 <- NULL
+colnames(prev_game_t2) <- c("num_date","team2","t2_rest_days","t2_last3",
+                            "t2_last5","t2_last10")
+
+all_games <- merge(all_games,
+                   prev_game_t1,
+                   by= c("num_date","team1"))
+
+all_games <- merge(all_games,
+                   prev_game_t2,
+                   by= c("num_date","team2"))
+
+all_games$rest_days_diff <- all_games$t1_rest_days - all_games$t2_rest_days
+all_games$last3_diff <- all_games$t1_last3 - all_games$t2_last3
+all_games$last5_diff <- all_games$t1_last5 - all_games$t2_last5
+all_games$last10_diff <- all_games$t1_last10 - all_games$t2_last10
+all_games$t1_rest_days <- NULL
+all_games$t1_last3 <- NULL
+all_games$t1_last5 <- NULL
+all_games$t1_last10 <- NULL
+all_games$t2_rest_days <- NULL
+all_games$t2_last3 <- NULL
+all_games$t2_last5 <- NULL
+all_games$t2_last10 <- NULL
+all_games$spread_fit <- 0.000020738510755*(all_games$spread^3) + 
+                                  0*(all_games$spread^2) - 0.033577236586623*all_games$spread + 
+                                  0.499999999999998
+all_games$result1 <- as.factor(all_games$result1)
+
+#### Model ####
+
+games_2018 <- all_games[all_games$season == 2018,]
+all_games <- all_games[all_games$season != 2018,]
+ctrl <- trainControl(method = "repeatedcv",
+                     number = 5,
+                     repeats = 2,
+                     savePred = T,
+                     classProb = T)
+
+train_nbr <- createDataPartition(all_games$result1,p=0.7, 
+                                 list=FALSE)
+train1final <- all_games[train_nbr,]
+test1final <- all_games[-train_nbr,]
+
+seasons <- unique(train1final$season)
+train1final$result1 <- ifelse(train1final$result1 == 0, "no","yes")
+
+
+#### Win Accuracy ####
+for (m in c("knn","svmLinearWeights")) {
+# for (m in c("rf","LogitBoost","ada","bagFDA","parRF","wsrf","glmboost",
+#             "C5.0","xgbLinear","knn","svmLinearWeights")) {
+  for (i in seasons) {
+    
+    print(paste0("Testing ",m," model against ",i," season results..."))
+    # Make test set the year i
+    train_set <- train1final[train1final$season != i,]
+    test_set <- train1final[train1final$season == i,]
+    
+    mod_rf <- train(result1 ~ playoff + spread + elo_diff + rest_days_diff +
+                      last3_diff + last5_diff + last10_diff + spread_fit,
+                    data=train_set,
+                    method=m,
+                    trControl = ctrl,
+                    metric="ROC")
+    
+    pred_rf <- predict(mod_rf, test_set, type="prob")
+    test_set$team1result1 <- ifelse(test_set$result1 == "yes",1,0)
+    test_set$predicted_rf <- pred_rf[,2]
+    test_set$predicted_rf[test_set$predicted_rf == 0] <- 0.000001
+    test_set$predicted_rf[test_set$predicted_rf == 1] <- 0.999999
+    test_set$predrf <- ifelse(test_set$predicted_rf<0.5,0,1)
+    test_set$log_loss <- -((test_set$team1result1 * log(test_set$predicted_rf)) + 
+                             ((1-test_set$team1result1) * log(1-test_set$predicted_rf)))
+    log_loss <- mean(test_set$log_loss)
+    test_set$accurate <- ifelse(test_set$team1result1 == test_set$predrf, 1, 0)
+    accuracy <- sum(test_set$accurate)/nrow(test_set)
+    
+    # Create data frame to save results
+    tmp_results <- data.frame(time_stamp = as.POSIXlt(Sys.time()),
+                              caret_model = mod_rf$method,
+                              model_desc = mod_rf$modelInfo$label,
+                              season = i,
+                              log_loss = log_loss,
+                              accuracy = accuracy)
+    
+    tryCatch(if (exists("mod_results")==FALSE) {
+      mod_results <- tmp_results
+    } else {
+      mod_results <- rbind(mod_results, tmp_results)
+    },error=function(e){cat("ERROR:",conditionMessage(e),"\n")})
+    
+  }
+}
+
+
+#### Spread Accuracy ####
+train1final$result1 <- ifelse(train1final$score1 - train1final$score2 +
+                                train1final$spread > 0, "yes",
+                              ifelse(train1final$score1 - train1final$score2 +
+                                       train1final$spread == 0, "push","no"))
+
+for (m in c("rf","LogitBoost","parRF","wsrf","knn")) {
+  for (i in seasons) {
+    
+    print(paste0("Testing ",m," model against ",i," season results..."))
+    # Make test set the year i
+    train_set <- train1final[train1final$season != i,]
+    test_set <- train1final[train1final$season == i,]
+    
+    mod_rf <- train(result1 ~ playoff + spread + elo_diff + rest_days_diff +
+                      last3_diff + last5_diff + last10_diff + spread_fit,
+                    data=train_set,
+                    method=m,
+                    trControl = ctrl,
+                    metric="ROC")
+    
+    pred_rf <- predict(mod_rf, test_set, type="raw")
+    table(pred_rf, test_set$result1)
+    test_set$predicted_rf <- pred_rf
+    pred_prob <- predict(mod_rf, test_set, type = "prob")
+    test_set$max_prob <- do.call('pmax',pred_prob)
+    test_set$max_prob_rnd <- round(do.call('pmax',pred_prob),1)
+    test_set$net_money <- ifelse(test_set$result1=="push",0,
+                                 ifelse(test_set$predicted_rf=="push",0,
+                                        ifelse(test_set$result1==test_set$predicted_rf,100,-110)))
+    test_set$accurate <- ifelse(test_set$result1 == test_set$predicted_rf, 1, 0)
+    test_set$caret_model <- mod_rf$method
+    test_set$model_desc = mod_rf$modelInfo$label
+
+    tryCatch(if (exists("test_results")==FALSE) {
+      test_results <- test_set
+    } else {
+      test_results <- rbind(test_results, test_set)
+    },error=function(e){cat("ERROR:",conditionMessage(e),"\n")})
+    
+  }
+}
+
+write.csv(test_results, "test_results_detail.csv", row.names = FALSE)
+
+# Predict over the entire dataset
+rf <- randomForest(result1 ~ playoff + spread + elo_diff + rest_days_diff +
+                     last3_diff + last5_diff + last10_diff + spread_fit,
+                   all_games,
+                   ntree = 300,
+                   importance = TRUE)
+games_2018$prediction <- predict(rf, games_2018, type = "response")
+confusionMatrix(games_2018$prediction, games_2018$result1)
+
+# Feature Importance
+imp <- importance(rf, type=1)
+featureImportance <- data.frame(Feature=row.names(imp), 
+                                Importance=imp[,1])
+ggplot(featureImportance, 
+       aes(x=reorder(Feature, Importance), 
+           y=Importance)) + 
+  geom_bar(stat="identity", fill="#d40511") +
+  coord_flip() +
+  theme_light(base_size=10) + 
+  xlab("") +
+  ylab("Importance") + 
+  ggtitle("Random Forest Feature Importance\n") +
+  theme(plot.title=element_text(size=18))

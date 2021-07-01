@@ -1,0 +1,225 @@
+rm(list=ls())
+
+library(jsonlite)
+library(RCurl)
+library(lubridate)
+library(randomForest)
+library(dplyr)
+library(caret)
+library(reshape2)
+library(zoo)
+
+## Pull Historical Lines
+# Regular Season
+for (y in seq(from=2002, to=2017, by=1)) {
+  for (w in seq(from=1, to=17, by=1)) {
+    print(paste0("Scraping ",y," Regular Season, Week ",w))
+    full_url <- paste0("https://fantasydata.com/NFLTeamStats/Odds_Read?sort=&page=1&pageSize=50",
+                  "&group=&filter=&filters.position=&filters.team=&filters.season=",y,
+                  "&filters.seasontype=1&filters.scope=&filters.subscope=&filters.redzonescope=&",
+                  "filters.scoringsystem=&filters.leaguetype=&filters.playerid=&filters.searchtext",
+                  "=&filters.week=",w,"&filters.startweek=&filters.endweek=&filters.minimumsnaps=",
+                  "&filters.teamaspect=&filters.stattype=&filters.exportType=")
+    url_json <- fromJSON(full_url)
+    tmp <- url_json$Data[,c(1:8)]
+    names(tmp) <- c("game_date","favorite","points_spread","underdog","over_under",
+                    "away_money_line","home_money_line","full_betting_line")
+    tryCatch(if (exists("nfl_lines")==FALSE) {
+      nfl_lines <- tmp
+    } else {
+      nfl_lines <- plyr::rbind.fill(nfl_lines, tmp)
+    },error=function(e){cat("ERROR:",conditionMessage(e),"\n")})
+  }
+}
+
+# Playoffs
+for (y in seq(from=2002, to=2017, by=1)) {
+  for (w in seq(from=1, to=4, by=1)) {
+    print(paste0("Scraping ",y," Postseason, Week ",w))
+    full_url <- paste0("https://fantasydata.com/NFLTeamStats/Odds_Read?sort=&page=1&pageSize=50",
+                       "&group=&filter=&filters.position=&filters.team=&filters.season=",y,
+                       "&filters.seasontype=3&filters.scope=&filters.subscope=&filters.redzonescope=&",
+                       "filters.scoringsystem=&filters.leaguetype=&filters.playerid=&filters.searchtext",
+                       "=&filters.week=",w,"&filters.startweek=&filters.endweek=&filters.minimumsnaps=",
+                       "&filters.teamaspect=&filters.stattype=&filters.exportType=")
+    url_json <- fromJSON(full_url)
+    tmp <- url_json$Data[,c(1:8)]
+    names(tmp) <- c("game_date","favorite","points_spread","underdog","over_under",
+                    "away_money_line","home_money_line","full_betting_line")
+    tryCatch(if (exists("nfl_lines")==FALSE) {
+      nfl_lines <- tmp
+    } else {
+      nfl_lines <- plyr::rbind.fill(nfl_lines, tmp)
+    },error=function(e){cat("ERROR:",conditionMessage(e),"\n")})
+  }
+}
+
+nfl_lines$points_spread <- as.numeric(nfl_lines$points_spread)
+nfl_lines$over_under <- as.numeric(nfl_lines$over_under)
+nfl_lines$away_money_line <- NULL
+nfl_lines$home_money_line <- NULL
+nfl_lines$full_betting_line <- NULL
+nfl_lines$over_under <- NULL
+
+for (i in 1:nrow(nfl_lines)) {
+  # Visitor
+  nfl_lines$team2[i] <- ifelse(substr(nfl_lines$underdog[i],1,2)=="at",
+                               nfl_lines$favorite[i],
+                               nfl_lines$underdog[i])
+  # Home
+  nfl_lines$team1[i] <- ifelse(substr(nfl_lines$favorite[i],1,2)=="at",
+                                  substr(nfl_lines$favorite[i],4,
+                                         nchar(nfl_lines$favorite[i])),
+                               substr(nfl_lines$underdog[i],4,
+                                      nchar(nfl_lines$underdog[i])))
+
+  # Change Line
+  nfl_lines$spread[i] <- ifelse(paste0("at ",nfl_lines$team1[i])==nfl_lines$favorite[i],
+                                     nfl_lines$points_spread[i],
+                                     nfl_lines$points_spread[i] * -1)
+  
+  # Trim Date
+    nfl_lines$game_date[i] <- substr(nfl_lines$game_date[i],1,
+                                     nchar(nfl_lines$game_date[i])-3)
+}
+nfl_lines$game_date <- gsub(",","",nfl_lines$game_date)
+nfl_lines$date_format <- mdy_hm(nfl_lines$game_date)
+nfl_lines$game_date <- as_date(nfl_lines$date_format)
+nfl_lines$date_format <- NULL
+nfl_lines$favorite <- NULL
+nfl_lines$underdog <- NULL
+nfl_lines$points_spread <- NULL
+nfl_lines$game_date[nfl_lines$game_date==as.Date("2017-01-01")] <- as.Date("2017-01-02")
+
+
+write.csv(nfl_lines, "nfl_lines.csv", row.names = FALSE)
+
+nfl_teams <- data.frame(name = c("49ers","Raiders","Buccaneers","Titans","Redskins","Jets",
+                                 "Ravens","Bears","Bengals","Browns","Rams","Packers",
+                                 "Cowboys","Colts","Dolphins","Steelers","Falcons","Panthers",
+                                 "Chiefs","Chargers","Vikings","Seahawks","Eagles","Saints",
+                                 "Broncos","Patriots","Giants","Bills","Jaguars","Cardinals",
+                                 "Lions","Texans"),
+                        abbr = c("SF","OAK","TB","TEN","WSH","NYJ","BAL","CHI","CIN",
+                                 "CLE","LAR","GB","DAL","IND","MIA","PIT","ATL","CAR",
+                                 "KC","LAC","MIN","SEA","PHI","NO","DEN","NE","NYG",
+                                 "BUF","JAX","ARI","DET","HOU"))
+
+# Historical Game Results w/ Elo
+results_txt <- getURL(paste0("https://raw.githubusercontent.com/fivethirtyeight/",
+                             "nfl-elo-game/master/data/nfl_games.csv"))
+all_games <- read.csv(text = results_txt,sep = ",")
+all_games$date <- as.character(all_games$date)
+all_games <- all_games[all_games$season>2001,]
+
+# 2018 Games
+txt_2018 <- getURL("https://projects.fivethirtyeight.com/nfl-api/2018/nfl_games_2018.csv")
+matchups2018 <- read.csv(text = txt_2018, sep = ",")
+matchups2018$date <- as.character(matchups2018$date)
+
+# Merge nfl teams with lines
+nfl_lines <- merge(nfl_lines,
+                   nfl_teams,
+                   by.x = "team1",
+                   by.y = "name")
+nfl_lines$team1 <- nfl_lines$abbr
+nfl_lines$abbr <- NULL
+
+nfl_lines <- merge(nfl_lines,
+                   nfl_teams,
+                   by.x = "team2",
+                   by.y = "name")
+nfl_lines$team2 <- nfl_lines$abbr
+nfl_lines$abbr <- NULL
+
+nfl_lines$season <- ifelse(month(nfl_lines$game_date)<3,
+                           year(nfl_lines$game_date)-1,
+                           year(nfl_lines$game_date))
+
+# Merge Lines with Historical games
+all_games <- merge(all_games,
+                   nfl_lines,
+                   by.x = c("season","team1","team2"),
+                   by.y = c("season","team1","team2"),
+                   all.x = TRUE)
+
+games_na <- all_games[is.na(all_games$spread),]
+all_games <- all_games[!is.na(all_games$spread),]
+
+# Not matching games are because Home/Away are flipped
+games_na$spread <- NULL
+games_na$game_date <- NULL
+games_na$team1a <- games_na$team2
+games_na$team2 <- games_na$team1
+games_na$team1 <- games_na$team1a
+games_na$team1a <- NULL
+games_na <- merge(games_na,
+                  nfl_lines,
+                  by.x = c("season","team1","team2"),
+                  by.y = c("season","team1","team2"),
+                  all.x = TRUE)
+all_games <- rbind(all_games,games_na)
+all_games$game_date <- NULL
+all_games$elo_diff <- all_games$elo1 - all_games$elo2
+all_games$elo1 <- NULL
+all_games$elo2 <- NULL
+all_games$elo_prob1 <- NULL
+
+### Model
+# Feature Engineering
+all_games$num_date <- as.numeric(as.Date(all_games$date))
+
+prev_game <- melt(all_games[,c("num_date","team1","team2","result1")],
+                  id=c("num_date","result1"))
+prev_game <- unique(prev_game)
+prev_game <- prev_game %>% 
+  group_by(value) %>% 
+  arrange(num_date) %>% 
+  mutate(rest_days = num_date - lag(num_date, default = first(num_date)))
+
+prev_game <- prev_game %>% 
+  arrange(value, num_date) %>% 
+  mutate(last_3 = rollsumr(result1, k = 3, fill = NA)/3) %>% 
+  mutate(last_5 = rollsumr(result1, k = 5, fill = NA)/5) %>% 
+  mutate(last_10 = rollsumr(result1, k = 10, fill = NA)/10)
+
+# Remove NA, split into team1 and team2, change column names, and rbind
+prev_game <- prev_game[!is.na(prev_game$last_10),]
+prev_game_t1 <- prev_game[prev_game$variable=="team1",]
+prev_game_t1$variable <- NULL
+prev_game_t1$result1 <- NULL
+colnames(prev_game_t1) <- c("num_date","team1","t1_rest_days","t1_last3",
+                            "t1_last5","t1_last10")
+
+prev_game_t2 <- prev_game[prev_game$variable=="team2",]
+prev_game_t2$variable <- NULL
+prev_game_t2$result1 <- NULL
+colnames(prev_game_t2) <- c("num_date","team2","t2_rest_days","t2_last3",
+                            "t2_last5","t2_last10")
+
+all_games <- merge(all_games,
+                   prev_game_t1,
+                   by= c("num_date","team1"))
+
+all_games <- merge(all_games,
+                   prev_game_t2,
+                   by= c("num_date","team2"))
+
+all_games$rest_days_diff <- all_games$t1_rest_days - all_games$t2_rest_days
+all_games$last3_diff <- all_games$t1_last3 - all_games$t2_last3
+all_games$last5_diff <- all_games$t1_last5 - all_games$t2_last5
+all_games$last10_diff <- all_games$t1_last10 - all_games$t2_last10
+all_games$t1_rest_days <- NULL
+all_games$t1_last3 <- NULL
+all_games$t1_last5 <- NULL
+all_games$t1_last10 <- NULL
+all_games$t2_rest_days <- NULL
+all_games$t2_last3 <- NULL
+all_games$t2_last5 <- NULL
+all_games$t2_last10 <- NULL
+
+all_games$result1 <- as.factor(all_games$result1)
+
+rf <- randomForest(result1 ~ neutral + playoff + spread + elo_diff + rest_days_diff +
+                     last3_diff + last5_diff + last10_diff,
+                   all_games)
